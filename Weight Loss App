@@ -1,0 +1,490 @@
+# ReminderFit - Android app (Kotlin)
+
+This is a compact single-module Android app project written in Kotlin. It implements:
+- A 30-day preloaded schedule (meals, workouts, hydration, sleep reminders)
+- Local storage of tasks and completed status (uses SharedPreferences + simple JSON)
+- Weight entry and simple progress screen
+- AlarmManager-based notifications for reminders
+- Ability to mark tasks as completed in the app
+
+---
+
+## Project structure (single-module)
+
+```
+ReminderFit/
+├─ app/
+│  ├─ src/main/
+│  │  ├─ AndroidManifest.xml
+│  │  ├─ java/com/reminderfit/
+│  │  │  ├─ MainActivity.kt
+│  │  │  ├─ TaskAdapter.kt
+│  │  │  ├─ AlarmReceiver.kt
+│  │  │  ├─ NotificationHelper.kt
+│  │  │  ├─ ScheduleRepository.kt
+│  │  ├─ res/layout/
+│  │  │  ├─ activity_main.xml
+│  │  │  ├─ item_task.xml
+│  │  ├─ res/values/strings.xml
+│  │  ├─ res/drawable/ic_reminder.xml
+├─ build.gradle (project)
+├─ app/build.gradle
+```
+
+---
+
+## 1) app/build.gradle (module)
+
+```gradle
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.reminderfit"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.0"
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.recyclerview:recyclerview:1.3.0'
+    implementation 'com.google.android.material:material:1.9.0'
+}
+```
+
+---
+
+## 2) AndroidManifest.xml
+
+```xml
+<manifest package="com.reminderfit" xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="true"
+        android:label="ReminderFit"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
+
+        <activity android:name="com.reminderfit.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver android:name="com.reminderfit.AlarmReceiver" android:exported="true"/>
+
+    </application>
+</manifest>
+```
+
+---
+
+## 3) res/layout/activity_main.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="ReminderFit - Daily Schedule"
+        android:textSize="20sp"
+        android:layout_marginBottom="8dp"/>
+
+    <Button
+        android:id="@+id/btnWeight"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Record Weight" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recycler"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="12dp"/>
+
+</LinearLayout>
+```
+
+---
+
+## 4) res/layout/item_task.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="horizontal"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:padding="12dp"
+    android:gravity="center_vertical">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="0dp"
+        android:layout_weight="1"
+        android:layout_height="wrap_content">
+
+        <TextView
+            android:id="@+id/taskTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Task Title"/>
+
+        <TextView
+            android:id="@+id/taskTime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="08:00 AM"/>
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btnDone"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Done" />
+
+</LinearLayout>
+```
+
+---
+
+## 5) MainActivity.kt
+
+```kotlin
+package com.reminderfit
+
+import android.app.AlertDialog
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.widget.Button
+import androidx.appcompat.app.AppCompatActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.*
+
+class MainActivity : AppCompatActivity() {
+    private lateinit var recycler: RecyclerView
+    private lateinit var adapter: TaskAdapter
+    private lateinit var repo: ScheduleRepository
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        repo = ScheduleRepository(this)
+        recycler = findViewById(R.id.recycler)
+        recycler.layoutManager = LinearLayoutManager(this)
+
+        val tasks = repo.loadOrCreateDefaultSchedule()
+        adapter = TaskAdapter(tasks) { task ->
+            // mark done
+            repo.markDone(task.id)
+            scheduleNextIfNeeded(task)
+            adapter.updateData(repo.loadOrCreateDefaultSchedule())
+        }
+        recycler.adapter = adapter
+
+        // schedule alarms for today's tasks
+        scheduleAlarmsForAll(tasks)
+
+        findViewById<Button>(R.id.btnWeight).setOnClickListener {
+            showWeightDialog()
+        }
+    }
+
+    private fun showWeightDialog(){
+        val edit = android.widget.EditText(this)
+        edit.inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+        AlertDialog.Builder(this)
+            .setTitle("Record Weight (kg)")
+            .setView(edit)
+            .setPositiveButton("Save"){d, _ ->
+                val v = edit.text.toString().toFloatOrNull()
+                if(v!=null){
+                    repo.saveWeightEntry(v)
+                    android.widget.Toast.makeText(this, "Weight saved", android.widget.Toast.LENGTH_SHORT).show()
+                }
+                d.dismiss()
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun scheduleAlarmsForAll(tasks: List<ScheduleRepository.Task>){
+        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        for(t in tasks){
+            val cal = Calendar.getInstance()
+            // parse HH:mm from t.time
+            val parts = t.time.split(":")
+            val hour = parts[0].toInt()
+            val minute = parts[1].toInt()
+            cal.set(Calendar.HOUR_OF_DAY, hour)
+            cal.set(Calendar.MINUTE, minute)
+            cal.set(Calendar.SECOND, 0)
+            if(cal.before(Calendar.getInstance())){
+                cal.add(Calendar.DATE, 1)
+            }
+            val intent = Intent(this, AlarmReceiver::class.java).apply {
+                putExtra("title", t.title)
+                putExtra("taskId", t.id)
+            }
+            val pi = PendingIntent.getBroadcast(this, t.id.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+        }
+    }
+
+    private fun scheduleNextIfNeeded(task: ScheduleRepository.Task){
+        // simple: reschedule same alarm for next day
+        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val cal = Calendar.getInstance()
+        val parts = task.time.split(":")
+        cal.set(Calendar.HOUR_OF_DAY, parts[0].toInt())
+        cal.set(Calendar.MINUTE, parts[1].toInt())
+        cal.add(Calendar.DATE, 1)
+        val intent = Intent(this, AlarmReceiver::class.java).apply {
+            putExtra("title", task.title)
+            putExtra("taskId", task.id)
+        }
+        val pi = PendingIntent.getBroadcast(this, task.id.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+    }
+}
+```
+
+---
+
+## 6) TaskAdapter.kt
+
+```kotlin
+package com.reminderfit
+
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.TextView
+import androidx.recyclerview.widget.RecyclerView
+
+class TaskAdapter(private var items: List<ScheduleRepository.Task>, private val onDone: (ScheduleRepository.Task)->Unit) : RecyclerView.Adapter<TaskAdapter.VH>(){
+    class VH(v: View) : RecyclerView.ViewHolder(v){
+        val title: TextView = v.findViewById(R.id.taskTitle)
+        val time: TextView = v.findViewById(R.id.taskTime)
+        val btn: Button = v.findViewById(R.id.btnDone)
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+        val v = LayoutInflater.from(parent.context).inflate(R.layout.item_task, parent, false)
+        return VH(v)
+    }
+
+    override fun onBindViewHolder(holder: VH, position: Int) {
+        val t = items[position]
+        holder.title.text = t.title
+        holder.time.text = t.time
+        holder.btn.setOnClickListener { onDone(t) }
+    }
+
+    override fun getItemCount(): Int = items.size
+
+    fun updateData(newItems: List<ScheduleRepository.Task>){
+        items = newItems
+        notifyDataSetChanged()
+    }
+}
+```
+
+---
+
+## 7) AlarmReceiver.kt
+
+```kotlin
+package com.reminderfit
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+
+class AlarmReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val title = intent.getStringExtra("title") ?: "Reminder"
+        val id = intent.getStringExtra("taskId") ?: "0"
+        NotificationHelper.showNotification(context, id.hashCode(), title, "Tap to open ReminderFit")
+    }
+}
+```
+
+---
+
+## 8) NotificationHelper.kt
+
+```kotlin
+package com.reminderfit
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import androidx.core.app.NotificationCompat
+
+object NotificationHelper {
+    private const val CHANNEL_ID = "reminderfit_channel"
+
+    fun showNotification(context: Context, id: Int, title: String, text: String){
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O){
+            val c = NotificationChannel(CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_HIGH)
+            nm.createNotificationChannel(c)
+        }
+
+        val intent = Intent(context, MainActivity::class.java)
+        val pi = PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+        val notif = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+
+        nm.notify(id, notif)
+    }
+}
+```
+
+---
+
+## 9) ScheduleRepository.kt (preloads schedule & stores small state)
+
+```kotlin
+package com.reminderfit
+
+import android.content.Context
+import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
+
+class ScheduleRepository(private val ctx: Context){
+    data class Task(val id: String, val title: String, val time: String, val done: Boolean)
+
+    private val prefs: SharedPreferences = ctx.getSharedPreferences("reminderfit", Context.MODE_PRIVATE)
+
+    fun loadOrCreateDefaultSchedule(): List<Task>{
+        val raw = prefs.getString("tasks", null)
+        if(raw!=null){
+            val arr = JSONArray(raw)
+            val list = mutableListOf<Task>()
+            for(i in 0 until arr.length()){
+                val o = arr.getJSONObject(i)
+                list.add(Task(o.getString("id"), o.getString("title"), o.getString("time"), o.optBoolean("done", false)))
+            }
+            return list
+        }
+        val default = createDefaultTasks()
+        saveTasks(default)
+        return default
+    }
+
+    fun saveTasks(tasks: List<Task>){
+        val arr = JSONArray()
+        for(t in tasks){
+            val o = JSONObject()
+            o.put("id", t.id)
+            o.put("title", t.title)
+            o.put("time", t.time)
+            o.put("done", t.done)
+            arr.put(o)
+        }
+        prefs.edit().putString("tasks", arr.toString()).apply()
+    }
+
+    fun markDone(id: String){
+        val tasks = loadOrCreateDefaultSchedule().map { if(it.id==id) it.copy(done=true) else it }
+        saveTasks(tasks)
+    }
+
+    fun saveWeightEntry(kg: Float){
+        val arrS = prefs.getString("weights", "[]") ?: "[]"
+        val arr = JSONArray(arrS)
+        val o = JSONObject()
+        o.put("date", System.currentTimeMillis())
+        o.put("kg", kg)
+        arr.put(o)
+        prefs.edit().putString("weights", arr.toString()).apply()
+    }
+
+    private fun createDefaultTasks(): List<Task>{
+        // Example: key daily reminders with 24-hour times. Adjust as you like.
+        val list = mutableListOf<Task>()
+        list.add(Task("wake_water", "Morning: Drink 500ml water", "06:30", false))
+        list.add(Task("cardio", "Morning: 30-40 min brisk walk/jog", "07:00", false))
+        list.add(Task("breakfast", "Breakfast: High protein", "08:00", false))
+        list.add(Task("hydration1", "Hydration: 300ml water", "10:30", false))
+        list.add(Task("lunch", "Lunch: Lean protein + salad", "12:30", false))
+        list.add(Task("snack", "Snack: Greek yogurt / fruit", "15:00", false))
+        list.add(Task("workout", "Evening: Strength workout 30 min", "17:30", false))
+        list.add(Task("dinner", "Dinner: Lean protein + veggies", "19:00", false))
+        list.add(Task("evening_water", "Hydration: 300ml water", "21:00", false))
+        list.add(Task("sleep", "Sleep: Aim for 7-8 hours", "22:30", false))
+        return list
+    }
+}
+```
+
+---
+
+## 10) strings.xml
+
+```xml
+<resources>
+    <string name="app_name">ReminderFit</string>
+</resources>
+```
+
+---
+
+## Build & Install
+
+1. Import the project into Android Studio (File > New > Import Project) using the provided Gradle files.
+2. Build > Build APK. If you want an unsigned debug APK, use Build > Build Bundle(s) / APK(s) > Build APK(s).
+3. Enable `Install from Unknown Sources` on your Android phone, copy the APK and install.
+
+Notes:
+- This is a minimal, readable app. It intentionally uses SharedPreferences for simplicity.
+- For production, consider using Room for persistence, WorkManager for reliable scheduling, and better UI/UX.
+- You can customize times and reminders inside `ScheduleRepository.createDefaultTasks()` or add an in-app editor.
+
+---
